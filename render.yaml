@@ -1,0 +1,15 @@
+# Render Blueprint: one web service that serves both the API (app.py) and the built frontend (dist/).
+# Render -> New -> Blueprint -> pick this repository, then paste the database's *Internal* URL into DB_URL.
+services:
+  - type: web
+    name: lotus-bf
+    runtime: python
+    plan: free
+    region: singapore            # same region as the database, otherwise the Internal URL does not resolve
+    buildCommand: pip install -r requirements.txt
+    # one worker + threads keeps numpy/scipy in memory once (free instances have 512 MB)
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 60
+    healthCheckPath: /help
+    envVars:
+      - key: DB_URL
+        sync: false              # secret: pasted by hand in the Render dashboard, never stored in git

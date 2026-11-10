@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LoTUS-BF · Location-or-Term Unified Search for Brain Functions</title>
+    <meta
+      name="description"
+      content="Search the Neurosynth literature by brain location, by term, or both. Boolean queries, study tables and meta-analytic brain maps."
+    />
+    <meta name="theme-color" content="#0f766e" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <script>
+      // Resolve the colour theme before first paint (no flash). "system" follows the OS.
+      (function () {
+        try {
+          var pref = localStorage.getItem('lotus-theme') || 'system'
+          var dark = pref === 'dark' || (pref === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+        } catch (e) {
+          document.documentElement.dataset.theme = 'light'
+        }
+      })()
+    </script>
+    <script type="module" crossorigin src="./assets/index-EcCJMjrG.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-DGa6j_HD.css">
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>LoTUS-BF needs JavaScript to run.</noscript>
+  </body>
+</html>
