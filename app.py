@@ -28,7 +28,7 @@ Query language (identical to the frontend, src/lib/query.js):
     locations can be mixed freely, with parentheses.
 
 Configuration (environment variables): DB_URL (or DATABASE_URL, required), LOTUS_SCHEMA (default "ns"),
-LOTUS_STATIC_DIR (default ./dist), LOTUS_STATEMENT_TIMEOUT_MS (default 20000), PORT (python app.py only).
+LOTUS_STATIC_DIR (default ./dist), LOTUS_STATEMENT_TIMEOUT_MS (default 45000), PORT (python app.py only).
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
 from werkzeug.exceptions import HTTPException
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 log = logging.getLogger("lotus-bf")
 
 # =============================================================================
@@ -62,7 +62,9 @@ if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", SCHEMA):  # it is spliced into SQ
     raise RuntimeError("LOTUS_SCHEMA must be a plain SQL identifier")
 
 TERM_PREFIX = "terms_abstract_tfidf__"  # prefix the course loader leaves on stored term names
-STATEMENT_TIMEOUT_MS = int(os.getenv("LOTUS_STATEMENT_TIMEOUT_MS", "20000"))
+# A small hosted database is ~30x slower than a laptop (measured on Render's free tier: 3 s for a term query, 13 s for a
+# 477k-peak map), so the default leaves room; Render itself allows a request 100 s.
+STATEMENT_TIMEOUT_MS = int(os.getenv("LOTUS_STATEMENT_TIMEOUT_MS", "45000"))
 DIST_DIR = Path(os.getenv("LOTUS_STATIC_DIR", Path(__file__).resolve().parent / "dist"))
 
 DEFAULT_RADIUS = 6.0
@@ -537,7 +539,8 @@ def _document_frequencies(conn) -> dict[str, int]:
     """In how many studies does each stored term occur? (computed once: the data are static)"""
     if _term_state["df"] is None:
         if _term_source(conn) == "terms":
-            sql = f"SELECT term, COUNT(DISTINCT study_id) FROM {SCHEMA}.annotations_terms GROUP BY term"
+            # one row per (study, term): see related_terms() for why COUNT(*) is exact here
+            sql = f"SELECT term, COUNT(*) FROM {SCHEMA}.annotations_terms GROUP BY term"
         else:
             sql = (
                 f"SELECT k.term, COUNT(DISTINCT aj.study_id) FROM {SCHEMA}.annotations_json aj "
@@ -558,9 +561,13 @@ def related_terms(conn, term: str, limit: Optional[int]) -> list[dict]:
         raise ApiError("The term annotations are missing or empty in the database (see /health).", 503)
     params = {"t": term, "tp": TERM_PREFIX + term}
     if source == "terms":
+        # The primary key is (study_id, contrast_id, term), but this dataset has one contrast per study, so a (study, term)
+        # pair is one row and COUNT(*) is the number of studies (tests/test_backend.py checks that). COUNT(DISTINCT study_id)
+        # would force PostgreSQL to sort every joined row (205k for "memory"): 0.6 s on a laptop, but the sort spills to
+        # disk and took > 20 s (a 503) on Render's free database. COUNT(*) is hash-aggregated: 60 ms locally.
         sql = f"""
             WITH a AS (SELECT DISTINCT study_id FROM {SCHEMA}.annotations_terms WHERE term IN (:t, :tp))
-            SELECT x.term AS term, COUNT(DISTINCT x.study_id) AS co_count, (SELECT COUNT(*) FROM a) AS n_a
+            SELECT x.term AS term, COUNT(*) AS co_count, (SELECT COUNT(*) FROM a) AS n_a
             FROM {SCHEMA}.annotations_terms x JOIN a USING (study_id)
             WHERE x.term NOT IN (:t, :tp) GROUP BY x.term"""
     else:
@@ -576,8 +583,10 @@ def related_terms(conn, term: str, limit: Optional[int]) -> list[dict]:
         clean = _strip_prefix(name)
         if not clean or clean[0].isdigit():
             continue
-        union = n_a + df.get(name, 0) - co  # |A| + |B| - |A and B|
-        out.append({"term": clean, "co_count": int(co), "jaccard": (co / union) if union else None})
+        n_b = df.get(name, int(co))
+        co = min(int(co), n_a, n_b)  # an intersection cannot exceed either set (guards the one-contrast-per-study assumption)
+        union = n_a + n_b - co  # |A| + |B| - |A and B|
+        out.append({"term": clean, "co_count": co, "jaccard": (co / union) if union else None})
     out.sort(key=lambda d: (-(d["jaccard"] if d["jaccard"] is not None else -1.0), -d["co_count"], d["term"]))
     out = out[:limit] if limit is not None else out
     with _term_lock:
@@ -669,14 +678,22 @@ def create_app() -> Flask:
     def on_api_error(err: ApiError):
         return jsonify({"error": err.message, **err.extra}), err.status
 
+    def timed_out(err: DBAPIError) -> bool:
+        return getattr(err.orig, "pgcode", None) == "57014"  # query_canceled: statement_timeout fired
+
     @app.errorhandler(OperationalError)
     def on_operational_error(err: OperationalError):
+        # psycopg2 raises a statement timeout (QueryCanceled) as an OperationalError too: tell it apart from "cannot connect"
+        if timed_out(err):
+            log.warning("statement timeout (%s ms)", STATEMENT_TIMEOUT_MS)
+            return jsonify({"error": "The query took too long. Try a more specific query."}), 504
         log.warning("database unavailable: %s", err.orig)
         return jsonify({"error": "The database is unavailable right now. Please try again later."}), 503
 
     @app.errorhandler(DBAPIError)
     def on_db_error(err: DBAPIError):
-        if getattr(err.orig, "pgcode", None) == "57014":  # query_canceled (statement_timeout)
+        if timed_out(err):
+            log.warning("statement timeout (%s ms)", STATEMENT_TIMEOUT_MS)
             return jsonify({"error": "The query took too long. Try a more specific query."}), 504
         log.exception("database error")
         return jsonify({"error": "The database could not run this query."}), 500
